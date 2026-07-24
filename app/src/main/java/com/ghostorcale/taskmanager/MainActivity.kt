@@ -147,6 +147,40 @@ fun setImmersive(view: android.view.View, hide: Boolean) {
     }
 }
 
+// Writes the given apps to a CSV in the app's cache dir, then opens the
+// share sheet via FileProvider so the user can save/send it anywhere.
+fun exportListToCsv(context: Context, apps: List<AppProc>) {
+    val exportsDir = java.io.File(context.cacheDir, "exports").apply { mkdirs() }
+    val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+    val file = java.io.File(exportsDir, "task_manager_export_$stamp.csv")
+
+    file.bufferedWriter().use { w ->
+        w.write("Label,Package,System,Background,LastUsed,Version\n")
+        apps.forEach { app ->
+            val lastUsed = if (app.lastUsed > 0)
+                SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(Date(app.lastUsed))
+            else ""
+            fun esc(s: String) = "\"" + s.replace("\"", "\"\"") + "\""
+            w.write(
+                listOf(
+                    esc(app.label), esc(app.packageName), app.isSystem, app.isRunningBg,
+                    esc(lastUsed), esc(app.versionName ?: "")
+                ).joinToString(",") + "\n"
+            )
+        }
+    }
+
+    val uri = androidx.core.content.FileProvider.getUriForFile(
+        context, "${context.packageName}.fileprovider", file
+    )
+    val shareIntent = Intent(Intent.ACTION_SEND).apply {
+        type = "text/csv"
+        putExtra(Intent.EXTRA_STREAM, uri)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+    context.startActivity(Intent.createChooser(shareIntent, "Export app list"))
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun AppRoot() {
@@ -236,12 +270,22 @@ fun AppRoot() {
                     Switch(checked = showHidden, onCheckedChange = { showHidden = it })
                 }
 
-                Text(
-                    "${filtered.size} apps  ·  ${apps.count { it.isRunningBg }} active in background",
-                    color = Color.White.copy(alpha = 0.6f),
-                    fontSize = 12.sp,
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
-                )
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        "${filtered.size} apps  ·  ${apps.count { it.isRunningBg }} active in background",
+                        color = Color.White.copy(alpha = 0.6f),
+                        fontSize = 12.sp,
+                        modifier = Modifier.weight(1f)
+                    )
+                    TextButton(onClick = { exportListToCsv(context, filtered) }) {
+                        Icon(Icons.Filled.FileDownload, contentDescription = null, tint = Color(0xFF00E5C7))
+                        Spacer(Modifier.width(4.dp))
+                        Text("Export list", color = Color(0xFF00E5C7))
+                    }
+                }
             } else {
                 // Focus mode: everything except the task list is hidden —
                 // status bar, nav bar, and the app's own top bar/search/switch.
