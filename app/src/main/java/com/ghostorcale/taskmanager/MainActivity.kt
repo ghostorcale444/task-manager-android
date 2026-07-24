@@ -135,6 +135,15 @@ suspend fun loadAllApps(context: Context): List<AppProc> = withContext(Dispatche
     }.sortedWith(compareByDescending<AppProc> { it.isRunningBg }.thenByDescending { it.lastUsed })
 }
 
+// Cheap poll — just the running-process set, no icon decoding or usage
+// stats query. Safe to call every few seconds for a "live" feel.
+suspend fun refreshRunningPkgs(context: Context): Set<String> = withContext(Dispatchers.IO) {
+    val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+    try {
+        am.runningAppProcesses?.flatMap { it.pkgList.toList() }?.toSet() ?: emptySet()
+    } catch (e: Exception) { emptySet() }
+}
+
 fun setImmersive(view: android.view.View, hide: Boolean) {
     val controller = WindowInsetsControllerCompat(
         (view.context as ComponentActivity).window, view
@@ -202,6 +211,19 @@ fun AppRoot() {
         }
     }
 
+    // Live update: every 4s, refresh just which apps are running in the
+    // background. Cheap (no icon decode / usage-stats query), so it doesn't
+    // cause the lag the old full-reload approach did.
+    LaunchedEffect(Unit) {
+        while (true) {
+            kotlinx.coroutines.delay(4000)
+            if (!isLoading && apps.isNotEmpty()) {
+                val running = refreshRunningPkgs(context)
+                apps = apps.map { it.copy(isRunningBg = running.contains(it.packageName)) }
+            }
+        }
+    }
+
     LaunchedEffect(focusMode) { setImmersive(view, focusMode) }
 
     val filtered by remember(apps, showHidden, query) {
@@ -230,7 +252,29 @@ fun AppRoot() {
         Column(modifier = Modifier.fillMaxSize()) {
             if (!focusMode) {
                 TopAppBar(
-                    title = { Text("Task Manager", fontWeight = FontWeight.Bold) },
+                    title = {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text("Lucario", fontWeight = FontWeight.Bold)
+                            Spacer(Modifier.width(8.dp))
+                            Box(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(50))
+                                    .background(Color(0xFF00E5C7).copy(alpha = 0.15f))
+                                    .padding(horizontal = 8.dp, vertical = 3.dp)
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(6.dp)
+                                            .clip(RoundedCornerShape(50))
+                                            .background(Color(0xFF00E5C7))
+                                    )
+                                    Spacer(Modifier.width(4.dp))
+                                    Text("Live", color = Color(0xFF00E5C7), fontSize = 11.sp)
+                                }
+                            }
+                        }
+                    },
                     colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent),
                     actions = {
                         IconButton(onClick = { focusMode = true }) {

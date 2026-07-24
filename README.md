@@ -1,4 +1,4 @@
-# Task Manager (Material You 3, Android)
+# Lucario (Material You 3, Android)
 
 Shows every installed app — including hidden/disabled system ones — with which are
 active in the background, a details view, and a kill/force-stop action.
