@@ -7,19 +7,18 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
-import android.graphics.drawable.Drawable
+import android.graphics.Bitmap
 import android.net.Uri
-import android.os.Build
 import android.os.Bundle
 import android.os.Process
 import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.compose.animation.core.*
-import androidx.compose.foundation.Canvas
+import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -30,26 +29,27 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.graphics.drawable.toBitmap
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.*
 
 data class AppProc(
     val label: String,
     val packageName: String,
-    val icon: Drawable?,
+    val icon: Bitmap?,
     val isSystem: Boolean,
     val isRunningBg: Boolean,
     val lastUsed: Long,
@@ -59,6 +59,8 @@ data class AppProc(
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
+        WindowCompat.setDecorFitsSystemWindows(window, false)
         setContent {
             TaskManagerTheme {
                 AppRoot()
@@ -87,7 +89,9 @@ fun hasUsageAccess(context: Context): Boolean {
     return mode == AppOpsManager.MODE_ALLOWED
 }
 
-fun loadAllApps(context: Context): List<AppProc> {
+// Runs off the main thread. Icons are decoded + downscaled ONCE here so
+// composables never touch Drawable->Bitmap conversion during recomposition.
+suspend fun loadAllApps(context: Context): List<AppProc> = withContext(Dispatchers.IO) {
     val pm = context.packageManager
     val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
     val runningPkgs = try {
@@ -105,11 +109,19 @@ fun loadAllApps(context: Context): List<AppProc> {
 
     val flags = PackageManager.MATCH_UNINSTALLED_PACKAGES or PackageManager.MATCH_DISABLED_COMPONENTS
     val apps = pm.getInstalledApplications(flags)
+    val iconSizePx = 96
 
-    return apps.map { ai: ApplicationInfo ->
+    apps.map { ai: ApplicationInfo ->
         val isSystem = (ai.flags and ApplicationInfo.FLAG_SYSTEM) != 0
         val label = try { pm.getApplicationLabel(ai).toString() } catch (e: Exception) { ai.packageName }
-        val icon = try { pm.getApplicationIcon(ai) } catch (e: Exception) { null }
+        val icon: Bitmap? = try {
+            val d = pm.getApplicationIcon(ai)
+            val bmp = Bitmap.createBitmap(iconSizePx, iconSizePx, Bitmap.Config.ARGB_8888)
+            val canvas = android.graphics.Canvas(bmp)
+            d.setBounds(0, 0, iconSizePx, iconSizePx)
+            d.draw(canvas)
+            bmp
+        } catch (e: Exception) { null }
         val versionName = try { pm.getPackageInfo(ai.packageName, 0).versionName } catch (e: Exception) { null }
         AppProc(
             label = label,
@@ -123,90 +135,157 @@ fun loadAllApps(context: Context): List<AppProc> {
     }.sortedWith(compareByDescending<AppProc> { it.isRunningBg }.thenByDescending { it.lastUsed })
 }
 
+fun setImmersive(view: android.view.View, hide: Boolean) {
+    val controller = WindowInsetsControllerCompat(
+        (view.context as ComponentActivity).window, view
+    )
+    if (hide) {
+        controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        controller.hide(WindowInsetsCompat.Type.systemBars())
+    } else {
+        controller.show(WindowInsetsCompat.Type.systemBars())
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun AppRoot() {
     val context = LocalContext.current
-    var apps by remember { mutableStateOf(loadAllApps(context)) }
+    val view = LocalView.current
+
+    var apps by remember { mutableStateOf<List<AppProc>>(emptyList()) }
+    var isLoading by remember { mutableStateOf(true) }
     var showHidden by remember { mutableStateOf(true) }
     var query by remember { mutableStateOf("") }
     var selected by remember { mutableStateOf<AppProc?>(null) }
     var usageGranted by remember { mutableStateOf(hasUsageAccess(context)) }
+    var focusMode by remember { mutableStateOf(false) }
 
-    val filtered = apps.filter {
-        (showHidden || !it.isSystem) &&
-        (query.isBlank() || it.label.contains(query, true) || it.packageName.contains(query, true))
+    LaunchedEffect(isLoading) {
+        if (isLoading) {
+            apps = loadAllApps(context)
+            isLoading = false
+        }
     }
 
-    Box(modifier = Modifier.fillMaxSize()) {
-        GeometricBackground()
+    LaunchedEffect(focusMode) { setImmersive(view, focusMode) }
+
+    val filtered by remember(apps, showHidden, query) {
+        derivedStateOf {
+            apps.filter {
+                (showHidden || !it.isSystem) &&
+                (query.isBlank() || it.label.contains(query, true) || it.packageName.contains(query, true))
+            }
+        }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(
+                Brush.verticalGradient(
+                    listOf(Color(0xFF120A24), Color(0xFF1B1035), Color(0xFF241247))
+                )
+            )
+    ) {
+        // Static geometric accents — drawn once, no per-frame redraw. This
+        // replaces the old animated full-screen blur, which was the main
+        // source of lag.
+        StaticGeometricAccents()
 
         Column(modifier = Modifier.fillMaxSize()) {
-            TopAppBar(
-                title = { Text("Task Manager", fontWeight = FontWeight.Bold) },
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent),
-                actions = {
-                    IconButton(onClick = { apps = loadAllApps(context) }) {
-                        Icon(Icons.Filled.Refresh, contentDescription = "Refresh", tint = Color.White)
-                    }
-                }
-            )
-
-            if (!usageGranted) {
-                GlassCard(modifier = Modifier.padding(12.dp)) {
-                    Column(Modifier.padding(14.dp)) {
-                        Text("Enable usage access for accurate 'last used' data", color = Color.White, fontWeight = FontWeight.SemiBold)
-                        Spacer(Modifier.height(8.dp))
-                        Button(onClick = {
-                            context.startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
-                        }) { Text("Open Settings") }
-                    }
-                }
-            }
-
-            OutlinedTextField(
-                value = query,
-                onValueChange = { query = it },
-                placeholder = { Text("Search apps") },
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
-                singleLine = true
-            )
-
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text("Show hidden / system apps", color = Color.White, modifier = Modifier.weight(1f))
-                Switch(checked = showHidden, onCheckedChange = { showHidden = it })
-            }
-
-            Text(
-                "${filtered.size} apps  ·  ${apps.count { it.isRunningBg }} active in background",
-                color = Color.White.copy(alpha = 0.6f),
-                fontSize = 12.sp,
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
-            )
-
-            LazyColumn(
-                modifier = Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(12.dp)
-            ) {
-                items(filtered) { app ->
-                    ProcessRow(
-                        app = app,
-                        onDetails = { selected = app },
-                        onKill = {
-                            val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-                            try { am.killBackgroundProcesses(app.packageName) } catch (e: Exception) {}
-                            apps = loadAllApps(context)
-                        },
-                        onForceStop = {
-                            val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
-                            intent.data = Uri.parse("package:${app.packageName}")
-                            context.startActivity(intent)
+            if (!focusMode) {
+                TopAppBar(
+                    title = { Text("Task Manager", fontWeight = FontWeight.Bold) },
+                    colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent),
+                    actions = {
+                        IconButton(onClick = { focusMode = true }) {
+                            Icon(Icons.Filled.Fullscreen, contentDescription = "Focus mode", tint = Color.White)
                         }
-                    )
-                    Spacer(Modifier.height(8.dp))
+                        IconButton(onClick = { isLoading = true }) {
+                            Icon(Icons.Filled.Refresh, contentDescription = "Refresh", tint = Color.White)
+                        }
+                    }
+                )
+
+                if (!usageGranted) {
+                    GlassCard(modifier = Modifier.padding(12.dp)) {
+                        Column(Modifier.padding(14.dp)) {
+                            Text("Enable usage access for accurate 'last used' data", color = Color.White, fontWeight = FontWeight.SemiBold)
+                            Spacer(Modifier.height(8.dp))
+                            Button(onClick = {
+                                context.startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
+                            }) { Text("Open Settings") }
+                        }
+                    }
+                }
+
+                OutlinedTextField(
+                    value = query,
+                    onValueChange = { query = it },
+                    placeholder = { Text("Search apps") },
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+                    singleLine = true
+                )
+
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Show hidden / system apps", color = Color.White, modifier = Modifier.weight(1f))
+                    Switch(checked = showHidden, onCheckedChange = { showHidden = it })
+                }
+
+                Text(
+                    "${filtered.size} apps  ·  ${apps.count { it.isRunningBg }} active in background",
+                    color = Color.White.copy(alpha = 0.6f),
+                    fontSize = 12.sp,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
+                )
+            } else {
+                // Focus mode: everything except the task list is hidden —
+                // status bar, nav bar, and the app's own top bar/search/switch.
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(12.dp)
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(Color.White.copy(alpha = 0.06f))
+                        .clickable { focusMode = false }
+                        .padding(12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(Icons.Filled.FullscreenExit, contentDescription = "Exit focus mode", tint = Color.White)
+                    Spacer(Modifier.width(8.dp))
+                    Text("Tap to exit focus mode", color = Color.White.copy(alpha = 0.8f), fontSize = 13.sp)
+                }
+            }
+
+            if (isLoading) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    CircularProgressIndicator(color = Color(0xFF00E5C7))
+                }
+            } else {
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(12.dp)
+                ) {
+                    items(items = filtered, key = { it.packageName }) { app ->
+                        ProcessRow(
+                            app = app,
+                            onDetails = { selected = app },
+                            onKill = {
+                                val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+                                try { am.killBackgroundProcesses(app.packageName) } catch (e: Exception) {}
+                            },
+                            onForceStop = {
+                                val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+                                intent.data = Uri.parse("package:${app.packageName}")
+                                context.startActivity(intent)
+                            }
+                        )
+                        Spacer(Modifier.height(8.dp))
+                    }
                 }
             }
         }
@@ -217,6 +296,14 @@ fun AppRoot() {
             onDismissRequest = { selected = null },
             confirmButton = {
                 TextButton(onClick = { selected = null }) { Text("Close") }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+                    intent.data = Uri.parse("package:${app.packageName}")
+                    context.startActivity(intent)
+                    selected = null
+                }) { Text("Force stop…") }
             },
             title = { Text(app.label) },
             text = {
@@ -244,7 +331,7 @@ fun ProcessRow(app: AppProc, onDetails: () -> Unit, onKill: () -> Unit, onForceS
         ) {
             app.icon?.let {
                 Image(
-                    bitmap = it.toBitmap(96, 96).asImageBitmap(),
+                    bitmap = it.asImageBitmap(),
                     contentDescription = null,
                     modifier = Modifier.size(40.dp).clip(RoundedCornerShape(10.dp))
                 )
@@ -290,38 +377,26 @@ fun GlassCard(modifier: Modifier = Modifier, content: @Composable () -> Unit) {
     }
 }
 
+// Static (non-animated) geometric shapes drawn once — no infinite
+// animation, no per-frame blur. Cheap to render, still looks intentional.
 @Composable
-fun GeometricBackground() {
-    val infinite = rememberInfiniteTransition(label = "bg")
-    val angle by infinite.animateFloat(
-        initialValue = 0f, targetValue = 360f,
-        animationSpec = infiniteRepeatable(tween(60000, easing = LinearEasing)),
-        label = "angle"
-    )
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(
-                Brush.verticalGradient(
-                    listOf(Color(0xFF120A24), Color(0xFF1B1035), Color(0xFF241247))
-                )
-            )
-    ) {
-        Canvas(modifier = Modifier.fillMaxSize().blur(60.dp)) {
-            rotate(angle, pivot = Offset(size.width * 0.2f, size.height * 0.15f)) {
-                drawCircle(
-                    color = Color(0xFF6C4CE0).copy(alpha = 0.35f),
-                    radius = size.minDimension * 0.35f,
-                    center = Offset(size.width * 0.2f, size.height * 0.15f)
-                )
-            }
-            rotate(-angle, pivot = Offset(size.width * 0.85f, size.height * 0.8f)) {
-                drawCircle(
-                    color = Color(0xFF00E5C7).copy(alpha = 0.22f),
-                    radius = size.minDimension * 0.3f,
-                    center = Offset(size.width * 0.85f, size.height * 0.8f)
-                )
-            }
-        }
+fun StaticGeometricAccents() {
+    Box(modifier = Modifier.fillMaxSize()) {
+        Box(
+            modifier = Modifier
+                .size(260.dp)
+                .align(Alignment.TopStart)
+                .offset((-80).dp, (-60).dp)
+                .clip(RoundedCornerShape(50))
+                .background(Color(0xFF6C4CE0).copy(alpha = 0.18f))
+        )
+        Box(
+            modifier = Modifier
+                .size(220.dp)
+                .align(Alignment.BottomEnd)
+                .offset(70.dp, 90.dp)
+                .clip(RoundedCornerShape(50))
+                .background(Color(0xFF00E5C7).copy(alpha = 0.12f))
+        )
     }
 }
